@@ -208,6 +208,8 @@ pub fn lakey_gadget_proof<R: CryptoRngCore>(
     // 3. Build a CS for Y = Com(F(k, x))
     lakey_gadget(&mut prover, &K_vars, Some(k), x, Y_var);
 
+    println!("Prover metrics: {:?}", prover.metrics());
+
     // 4. Make a proof for CS
     let proof = prover.prove(bp_gens)?;
 
@@ -236,8 +238,10 @@ pub fn lakey_gadget_verify(
     let K_vars: Vec<_> = K.iter().map(|ki| verifier.commit(*ki)).collect();
     let Y_var = verifier.commit(Y);
 
-    // 3. Build a CS for Y = Com(F(k, x))
+    // 3. Build a CS for Y = F(K, x)
     lakey_gadget(&mut verifier, &K_vars, None, x, Y_var);
+
+    println!("Verifier metrics: {:?}", verifier.metrics());
 
     // 4. Verify the proof
     verifier
