@@ -5,6 +5,8 @@ extern crate curve25519_dalek;
 extern crate merlin;
 extern crate rand;
 
+mod pok;
+
 use std::convert::TryInto;
 use std::error::Error;
 use std::ops::{Add, Mul};
@@ -18,6 +20,8 @@ use rand::{RngCore, SeedableRng};
 use rand_chacha::ChaChaRng;
 use rand_core::CryptoRngCore;
 use sha3::{Digest, Sha3_256};
+
+type SchnorrProof = pok::Proof;
 
 const LATTICE_DIM: usize = 512;
 const ROW_COUNT: usize = 32;
@@ -148,7 +152,7 @@ pub fn lakey_acc<
     })
 }
 
-/// Constrains Y = G * F(k, x) && K == Com(k), where F(k, x) = Acc(Trunc(H(x) * k)).
+/// Constrains Y = Com(F(k, x)), assuming K == Com(k).
 pub fn lakey_gadget<CS: ConstraintSystem>(
     cs: &mut CS,
     K: &[Variable],
@@ -159,15 +163,16 @@ pub fn lakey_gadget<CS: ConstraintSystem>(
     let A: Vec<Vec<Scalar>> = lakey_hash(x).unwrap();
     let Y1: Vec<LinearCombination> = mat_mul(&A, K);
 
+    // A*K == A*k
     let Y1_bits: Vec<Vec<Variable>> = if let Some(k) = k {
         let y1: Vec<Scalar> = mat_mul(&A, k);
         Y1.iter()
             .zip(y1.iter())
-            .map(|(a, b)| bin_equality_gadget(cs, a, Some(*b)).unwrap())
+            .map(|(Yi, yi)| bin_equality_gadget(cs, Yi, Some(*yi)).unwrap())
             .collect()
     } else {
         Y1.iter()
-            .map(|a| bin_equality_gadget(cs, a, None).unwrap())
+            .map(|Yi| bin_equality_gadget(cs, Yi, None).unwrap())
             .collect()
     };
 
@@ -178,15 +183,16 @@ pub fn lakey_gadget<CS: ConstraintSystem>(
 }
 
 // Prover's scope
-pub fn lakey_gadget_proof(
+pub fn lakey_gadget_proof<R: CryptoRngCore>(
+    rng: &mut R,
     pc_gens: &PedersenGens,
     bp_gens: &BulletproofGens,
     k: &[Scalar],
-    K_open: &[Scalar],
+    d: &[Scalar],
     x: &[u8],
     y: Scalar,
-) -> Result<R1CSProof, R1CSError> {
-    let mut transcript = Transcript::new(b"R1CSLakeyGadget");
+) -> Result<(R1CSProof, SchnorrProof), R1CSError> {
+    let mut transcript = Transcript::new(b"eLaKeyR1CSProof");
 
     // 1. Create a prover
     let mut prover = Prover::new(pc_gens, &mut transcript);
@@ -194,18 +200,22 @@ pub fn lakey_gadget_proof(
     // 2. Commit high-level variables
     let (_, K_vars): (Vec<_>, Vec<_>) = k
         .iter()
-        .zip(K_open)
-        .map(|(ki, ri)| prover.commit(*ki, *ri))
+        .zip(d.iter())
+        .map(|(ki, di)| prover.commit(*ki, *di))
         .unzip();
     let (_, Y_var) = prover.commit(y, Scalar::ZERO);
 
-    // 3. Build a CS
+    // 3. Build a CS for Y = Com(F(k, x))
     lakey_gadget(&mut prover, &K_vars, Some(k), x, Y_var);
 
-    // 4. Make a proof
+    // 4. Make a proof for CS
     let proof = prover.prove(bp_gens)?;
 
-    Ok(proof)
+    // 5. Make a proof for Y = Com(y, 0)
+    let Y = pc_gens.commit(y, Scalar::ZERO).compress();
+    let y_proof = pok::generate_pok(rng, &Y, &y, b"eLaKeySchnorrProof");
+
+    Ok((proof, y_proof))
 }
 
 // Verifier logic
@@ -215,30 +225,35 @@ pub fn lakey_gadget_verify(
     K: &[CompressedRistretto],
     x: &[u8],
     Y: CompressedRistretto,
-    proof: R1CSProof,
+    proof: (R1CSProof, SchnorrProof),
 ) -> Result<(), R1CSError> {
-    let mut transcript = Transcript::new(b"R1CSLakeyGadget");
+    let mut transcript = Transcript::new(b"eLaKeyR1CSProof");
 
     // 1. Create a verifier
     let mut verifier = Verifier::new(&mut transcript);
 
     // 2. Commit high-level variables
-    // let vars: Vec<_> = commitments.iter().map(|V| verifier.commit(*V)).collect();
     let K_vars: Vec<_> = K.iter().map(|ki| verifier.commit(*ki)).collect();
     let Y_var = verifier.commit(Y);
 
-    // 3. Build a CS
+    // 3. Build a CS for Y = Com(F(k, x))
     lakey_gadget(&mut verifier, &K_vars, None, x, Y_var);
 
     // 4. Verify the proof
     verifier
-        .verify(&proof, &pc_gens, &bp_gens)
-        .map_err(|_| R1CSError::VerificationError)
+        .verify(&proof.0, &pc_gens, &bp_gens)
+        .map_err(|_| R1CSError::VerificationError)?;
+
+    // 5. Verify that Y = G * y.
+    match pok::verify_pok(&Y, &proof.1, b"eLaKeySchnorrProof") {
+        true => Ok(()),
+        false => Err(R1CSError::VerificationError),
+    }
 }
 
 pub struct PrivateKey {
     k: Vec<Scalar>,
-    K_open: Vec<Scalar>,
+    d: Vec<Scalar>,
     pc_gens: PedersenGens,
     bp_gens: BulletproofGens,
 }
@@ -265,18 +280,21 @@ pub fn lakey_keygen<R: CryptoRngCore>(rng: &mut R) -> KeyPair {
     let k = (0..LATTICE_DIM)
         .map(|_| (rng.next_u64() % q).into())
         .collect::<Vec<_>>();
-    let K_open = (0..LATTICE_DIM)
+
+    let d = (0..LATTICE_DIM)
         .map(|_| Scalar::random(rng))
         .collect::<Vec<_>>();
+
     let K = k
         .iter()
-        .zip(K_open.iter())
-        .map(|(ki, ri)| pc_gens.commit(*ki, *ri).compress())
+        .zip(d.iter())
+        .map(|(ki, di)| pc_gens.commit(*ki, *di).compress())
         .collect::<Vec<_>>();
+
     KeyPair {
         private: PrivateKey {
             k,
-            K_open,
+            d,
             pc_gens,
             bp_gens: bp_gens.clone(),
         },
@@ -301,16 +319,16 @@ pub fn lakey_trunc_scalar(x: &[Scalar]) -> Vec<Scalar> {
 pub struct EvalResult {
     pub y: Scalar,
     pub Y: CompressedRistretto,
-    pub proof: R1CSProof,
+    pub proof: (R1CSProof, SchnorrProof),
 }
 
-pub fn lakey_eval(k: &PrivateKey, x: &[u8]) -> EvalResult {
+pub fn lakey_eval<R: CryptoRngCore>(rng: &mut R, k: &PrivateKey, x: &[u8]) -> EvalResult {
     let A = lakey_hash(x).unwrap();
     let y1 = mat_mul(&A, &k.k);
     let y2 = lakey_trunc_scalar(&y1);
     let y: Scalar = lakey_acc(&y2, Scalar::from(1u64 << LOG2P));
     let Y = k.pc_gens.commit(y, Scalar::ZERO).compress();
-    let proof = lakey_gadget_proof(&k.pc_gens, &k.bp_gens, &k.k, &k.K_open, x, y).unwrap();
+    let proof = lakey_gadget_proof(rng, &k.pc_gens, &k.bp_gens, &k.k, &k.d, x, y).unwrap();
     EvalResult { y, Y, proof }
 }
 
@@ -318,7 +336,7 @@ pub fn lakey_verify(
     k: &PublicKey,
     x: &[u8],
     Y: CompressedRistretto,
-    proof: R1CSProof,
+    proof: (R1CSProof, SchnorrProof),
 ) -> Result<(), R1CSError> {
     lakey_gadget_verify(&k.pc_gens, &k.bp_gens, &k.K, x, Y, proof)
 }
@@ -342,10 +360,13 @@ mod tests {
         // Evaluation.
         let x = rng.next_u64().to_be_bytes();
         let start = Instant::now();
-        let y = lakey_eval(&key_pair.private, &x);
+        let y = lakey_eval(&mut rng, &key_pair.private, &x);
         println!("Eval time: {:?}", start.elapsed());
         println!("PRF output: {:?}", y.y.as_bytes());
-        println!("Proof size: {:?}", y.proof.serialized_size());
+        println!(
+            "Proof size: {:?}",
+            (y.proof.0.serialized_size() + size_of::<SchnorrProof>())
+        );
 
         let start = Instant::now();
         assert!(lakey_verify(&key_pair.public, &x, y.Y, y.proof.clone()).is_ok());
